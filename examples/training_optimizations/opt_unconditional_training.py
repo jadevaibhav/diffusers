@@ -8,6 +8,7 @@ from pathlib import Path
 import yaml
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from datasets import load_dataset
@@ -38,7 +39,6 @@ class Trainer:
         self.train_dataloader = self._initialize_dataloader(args)
         self.lr_scheduler = self._initialize_lr_scheduler(args)
         self.use_SNR_weights = args.use_SNR_weights
-
 
     def _initialize_accelerator(self, args):
         logging_dir = os.path.join(args.output_dir, args.logging_dir)
@@ -230,6 +230,19 @@ class Trainer:
                 torch.save(self.ema_model.state_dict(), os.path.join(checkpoint_dir, "ema.pt"))
             logger.info(f"Checkpoint saved at {checkpoint_dir}")
             
+    def get_orig_from_velocity(self,model_output,timestep,sample):
+        alpha_prod_t = self.noise_scheduler.alphas_cumprod[timestep].view(-1,1,1,1,1)
+        beta_prod_t = 1 - alpha_prod_t
+        pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
+        if self.noise_scheduler.config.thresholding:
+                pred_original_sample = self.noise_scheduler._threshold_sample(pred_original_sample)
+        elif self.noise_scheduler.config.clip_sample:
+            pred_original_sample = pred_original_sample.clamp(
+                -self.noise_scheduler.config.clip_sample_range, self.noise_scheduler.config.clip_sample_range
+            )
+
+        return pred_original_sample
+
     def train(self):
         if self.accelerator:
             self.model, self.optimizer, self.train_dataloader, self.lr_scheduler = self.accelerator.prepare(
@@ -257,26 +270,31 @@ class Trainer:
             self.model.train()
             for step, batch in enumerate(self.train_dataloader):
                 with self.accelerator.accumulate(self.model):
-                    # Predict the noise residual
-                    noise_pred = model(noisy_images, timesteps)
+                    # Sample noise that we'll add to the latents
+                    clean_images = batch['input']
+                    noise = torch.randn_like(clean_images)
+                    bsz = noise.shape[0]
+                    # Sample a random timestep for each image
+                    timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=noise.device)
+                    timesteps = timesteps.long()
 
-                    if noise_scheduler.config.prediction_type == "v_prediction":
-                        #alpha_t = noise_scheduler.alphas[timesteps].view(-1,1,1,1,1)
-                        #v_pred = alpha_t*noise - torch.sqrt(1-alpha_t**2)*clean_images
-                        v_pred = noise_scheduler.get_velocity(clean_images,noise,timesteps)
-                        v_recon = get_orig_from_velocity(noise_pred,timesteps,noisy_images,noise_scheduler)
-                        # loss = F.huber_loss(weights*noise_pred, weights*v_pred)
+                    # Add noise to the latents according to the noise magnitude at each timestep
+                    # (this is the forward diffusion process)
+                    noisy_images = self.noise_scheduler.add_noise(clean_images, noise, timesteps)
+
+                    # Predict the noise residual
+                    noise_pred = self.model(noisy_images, timesteps).sample
+
+                    if self.noise_scheduler.config.prediction_type == "v_prediction":
+                        v_pred = self.noise_scheduler.get_velocity(clean_images,noise,timesteps)
                         loss = F.huber_loss(noise_pred, v_pred)
 
-                    elif noise_scheduler.config.prediction_type == "epsilon":
-                        # loss = F.huber_loss(weights*noise_pred, weights*noise)
+                    elif self.noise_scheduler.config.prediction_type == "epsilon":
                         loss = F.huber_loss(noise_pred, noise)
-                        v_recon = noisy_images - noise_pred
 
-                    elif noise_scheduler.config.prediction_type == "sample":
-                        # loss = F.huber_loss(weights*noise_pred, weights*clean_images)
+                    elif self.noise_scheduler.config.prediction_type == "sample":
                         loss = F.huber_loss(noise_pred, clean_images)
-                        v_recon = noise_pred
+                        
                     self.accelerator.backward(loss)
 
                     if self.accelerator.sync_gradients:
@@ -366,12 +384,12 @@ def parse_args():
     parser.add_argument('--ddpm_num_inference_steps', type=int, default=1000, help="Number of inference steps in DDPM")
     parser.add_argument('--ddpm_beta_schedule', type=str, choices=['linear', 'cosine'], default='linear', help="Beta schedule for DDPM")
     parser.add_argument('--prediction_type', type=str, choices=['epsilon', 'sample', 'v_prediction'], default='epsilon', help="Prediction type for DDPM")
-    parser.add_argument(
-    "--rescale_betas_zero_snr", 
-    type=bool, 
-    default=False, 
-    help="Rescale betas to achieve zero SNR during training in DDPM."
-)
+    parser.add_argument("--rescale_betas_zero_snr", type=bool, default=False, help="Rescale betas to achieve zero SNR during training in DDPM.")
+    
+    # Loss weighting
+    parser.add_argument("--use_SNR_weights", action="store_true", type=bool, default=True, help="Whether to use SNR weighting in the loss function.")
+
+
     # EMA config
     parser.add_argument('--ema_inv_gamma', type=float, default=1.0, help="EMA inverse gamma")
     parser.add_argument('--ema_power', type=float, default=0.75, help="EMA power")
