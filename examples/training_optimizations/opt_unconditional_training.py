@@ -5,6 +5,7 @@ import math
 import os
 from datetime import timedelta
 from pathlib import Path
+import yaml
 
 import torch
 from torch.utils.data import DataLoader
@@ -228,224 +229,314 @@ class Trainer:
 
         # Training loop here...
 
+
+def parse_yaml_config(yaml_file):
+    """Parse the YAML configuration file."""
+    with open(yaml_file, 'r') as file:
+        config = yaml.safe_load(file)
+    return config
+
+def merge_args_with_config(args, config):
+    """Merge command-line arguments with YAML configuration, giving priority to command-line args."""
+    for key, value in config.items():
+        if isinstance(value, dict):
+            # For nested dictionaries, we need to handle merging recursively
+            for sub_key, sub_value in value.items():
+                if hasattr(args, sub_key):
+                    setattr(args, sub_key, sub_value)
+        else:
+            if hasattr(args, key):
+                setattr(args, key, value)
+    return args
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Simple example of a training script.")
-    parser.add_argument(
-        "--dataset_name",
-        type=str,
-        default=None,
-        help=(
-            "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
-            " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
-            " or to a folder containing files that HF Datasets can understand."
-        ),
-    )
-    parser.add_argument(
-        "--dataset_config_name",
-        type=str,
-        default=None,
-        help="The config of the Dataset, leave as None if there's only one config.",
-    )
-    parser.add_argument(
-        "--model_config_name_or_path",
-        type=str,
-        default=None,
-        help="The config of the UNet model to train, leave as None to use standard DDPM configuration.",
-    )
-    parser.add_argument(
-        "--train_data_dir",
-        type=str,
-        default=None,
-        help=(
-            "A folder containing the training data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
-            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
-        ),
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="ddpm-model-64",
-        help="The output directory where the model predictions and checkpoints will be written.",
-    )
-    parser.add_argument("--overwrite_output_dir", action="store_true")
-    parser.add_argument(
-        "--cache_dir",
-        type=str,
-        default=None,
-        help="The directory where the downloaded models and datasets will be stored.",
-    )
-    parser.add_argument(
-        "--resolution",
-        type=int,
-        default=64,
-        help=(
-            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
-            " resolution"
-        ),
-    )
-    parser.add_argument(
-        "--center_crop",
-        default=False,
-        action="store_true",
-        help=(
-            "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
-            " cropped. The images will be resized to the resolution first before cropping."
-        ),
-    )
-    parser.add_argument(
-        "--random_flip",
-        default=False,
-        action="store_true",
-        help="whether to randomly flip images horizontally",
-    )
-    parser.add_argument(
-        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
-    )
-    parser.add_argument(
-        "--eval_batch_size", type=int, default=16, help="The number of images to generate for evaluation."
-    )
-    parser.add_argument(
-        "--dataloader_num_workers",
-        type=int,
-        default=0,
-        help=(
-            "The number of subprocesses to use for data loading. 0 means that the data will be loaded in the main"
-            " process."
-        ),
-    )
-    parser.add_argument("--num_epochs", type=int, default=100)
-    parser.add_argument("--save_images_epochs", type=int, default=10, help="How often to save images during training.")
-    parser.add_argument(
-        "--save_model_epochs", type=int, default=10, help="How often to save the model during training."
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        type=int,
-        default=1,
-        help="Number of updates steps to accumulate before performing a backward/update pass.",
-    )
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=1e-4,
-        help="Initial learning rate (after the potential warmup period) to use.",
-    )
-    parser.add_argument(
-        "--lr_scheduler",
-        type=str,
-        default="cosine",
-        help=(
-            'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
-            ' "constant", "constant_with_warmup"]'
-        ),
-    )
-    parser.add_argument(
-        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
-    )
-    parser.add_argument("--adam_beta1", type=float, default=0.95, help="The beta1 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
-    parser.add_argument(
-        "--adam_weight_decay", type=float, default=1e-6, help="Weight decay magnitude for the Adam optimizer."
-    )
-    parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer.")
-    parser.add_argument(
-        "--use_ema",
-        action="store_true",
-        help="Whether to use Exponential Moving Average for the final model weights.",
-    )
-    parser.add_argument("--ema_inv_gamma", type=float, default=1.0, help="The inverse gamma value for the EMA decay.")
-    parser.add_argument("--ema_power", type=float, default=3 / 4, help="The power value for the EMA decay.")
-    parser.add_argument("--ema_max_decay", type=float, default=0.9999, help="The maximum decay magnitude for EMA.")
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
-    parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
-    parser.add_argument(
-        "--hub_model_id",
-        type=str,
-        default=None,
-        help="The name of the repository to keep in sync with the local `output_dir`.",
-    )
-    parser.add_argument(
-        "--hub_private_repo", action="store_true", help="Whether or not to create a private repository."
-    )
-    parser.add_argument(
-        "--logger",
-        type=str,
-        default="tensorboard",
-        choices=["tensorboard", "wandb"],
-        help=(
-            "Whether to use [tensorboard](https://www.tensorflow.org/tensorboard) or [wandb](https://www.wandb.ai)"
-            " for experiment tracking and logging of model metrics and model checkpoints"
-        ),
-    )
-    parser.add_argument(
-        "--logging_dir",
-        type=str,
-        default="logs",
-        help=(
-            "[TensorBoard](https://www.tensorflow.org/tensorboard) log directory. Will default to"
-            " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
-        ),
-    )
-    parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
-    parser.add_argument(
-        "--mixed_precision",
-        type=str,
-        default="no",
-        choices=["no", "fp16", "bf16"],
-        help=(
-            "Whether to use mixed precision. Choose"
-            "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
-            "and an Nvidia Ampere GPU."
-        ),
-    )
-    parser.add_argument(
-        "--prediction_type",
-        type=str,
-        default="epsilon",
-        choices=["epsilon", "sample", "v_prediction"],
-        help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0', OR use velocity prediction.",
-    )
-    parser.add_argument("--ddpm_num_steps", type=int, default=1000)
-    parser.add_argument("--ddpm_num_inference_steps", type=int, default=1000)
-    parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
-    parser.add_argument(
-        "--checkpointing_steps",
-        type=int,
-        default=500,
-        help=(
-            "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
-            " training using `--resume_from_checkpoint`."
-        ),
-    )
-    parser.add_argument(
-        "--checkpoints_total_limit",
-        type=int,
-        default=None,
-        help=("Max number of checkpoints to store."),
-    )
-    parser.add_argument(
-        "--resume_from_checkpoint",
-        type=str,
-        default=None,
-        help=(
-            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
-            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
-        ),
-    )
-    parser.add_argument(
-        "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
-    )
+    parser = argparse.ArgumentParser(description="DDPM Training Configuration")
+
+    # Add YAML config argument
+    parser.add_argument('--config_file', type=str, default=None, help="Path to the YAML configuration file")
+
+    # Training config
+    parser.add_argument('--output_dir', type=str, default="ddpm-model-64", help="Directory to output model and images")
+    parser.add_argument('--overwrite_output_dir', action='store_true', help="Overwrite output directory if it exists")
+    parser.add_argument('--cache_dir', type=str, default=None, help="Cache directory")
+    parser.add_argument('--num_epochs', type=int, default=100, help="Number of training epochs")
+    parser.add_argument('--save_images_epochs', type=int, default=10, help="Save generated images every N epochs")
+    parser.add_argument('--save_model_epochs', type=int, default=10, help="Save model checkpoints every N epochs")
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help="Number of gradient accumulation steps")
+    parser.add_argument('--train_batch_size', type=int, default=16, help="Training batch size")
+    parser.add_argument('--eval_batch_size', type=int, default=16, help="Evaluation batch size")
+    parser.add_argument('--dataloader_num_workers', type=int, default=0, help="Number of dataloader workers")
+    parser.add_argument('--resume_from_checkpoint', type=str, default=None, help="Resume from checkpoint path")
+    parser.add_argument('--checkpointing_steps', type=int, default=500, help="Number of steps between checkpoints")
+    parser.add_argument('--checkpoints_total_limit', type=int, default=None, help="Max number of checkpoints to keep")
+    parser.add_argument('--local_rank', type=int, default=-1, help="Local rank for distributed training")
+    parser.add_argument('--logger', type=str, default="tensorboard", help="Logger type (e.g., tensorboard)")
+    parser.add_argument('--logging_dir', type=str, default="logs", help="Directory for logging")
+    parser.add_argument('--mixed_precision', type=str, choices=['no', 'fp16', 'bf16'], default="no", help="Mixed precision training")
+    parser.add_argument('--push_to_hub', action='store_true', help="Push model to Hugging Face hub")
+    parser.add_argument('--hub_model_id', type=str, default=None, help="Model ID for Hugging Face hub")
+    parser.add_argument('--hub_private_repo', action='store_true', help="Create private repo on Hugging Face hub")
+    parser.add_argument('--hub_token', type=str, default=None, help="Hugging Face token")
+    parser.add_argument('--enable_xformers_memory_efficient_attention', action='store_true', help="Use memory efficient attention (xformers)")
+    parser.add_argument('--use_ema', action='store_true', help="Use exponential moving average (EMA)")
+
+    # Image augmentation config
+    parser.add_argument('--resolution', type=int, default=64, help="Image resolution")
+    parser.add_argument('--center_crop', action='store_true', help="Center crop the images")
+    parser.add_argument('--random_flip', action='store_true', help="Randomly flip images during training")
+
+    # Learning rate and scheduler config
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help="Initial learning rate")
+    parser.add_argument('--lr_scheduler', type=str, choices=['linear', 'cosine', 'cosine_with_restarts', 'polynomial', 'constant', 'constant_with_warmup'], default='cosine', help="Learning rate scheduler type")
+    parser.add_argument('--lr_warmup_steps', type=int, default=500, help="Number of warmup steps")
+    parser.add_argument('--adam_beta1', type=float, default=0.95, help="Beta1 for Adam optimizer")
+    parser.add_argument('--adam_beta2', type=float, default=0.999, help="Beta2 for Adam optimizer")
+    parser.add_argument('--adam_weight_decay', type=float, default=1e-6, help="Weight decay for Adam optimizer")
+    parser.add_argument('--adam_epsilon', type=float, default=1e-08, help="Epsilon for Adam optimizer")
+
+    # DDPM noise schedule config
+    parser.add_argument('--ddpm_num_steps', type=int, default=1000, help="Number of DDPM steps")
+    parser.add_argument('--ddpm_num_inference_steps', type=int, default=1000, help="Number of inference steps in DDPM")
+    parser.add_argument('--ddpm_beta_schedule', type=str, choices=['linear', 'cosine'], default='linear', help="Beta schedule for DDPM")
+    parser.add_argument('--prediction_type', type=str, choices=['epsilon', 'sample', 'v_prediction'], default='epsilon', help="Prediction type for DDPM")
+
+    # EMA config
+    parser.add_argument('--ema_inv_gamma', type=float, default=1.0, help="EMA inverse gamma")
+    parser.add_argument('--ema_power', type=float, default=0.75, help="EMA power")
+    parser.add_argument('--ema_max_decay', type=float, default=0.9999, help="EMA maximum decay")
+
+    # Dataset config
+    parser.add_argument('--dataset_name', type=str, default=None, help="Dataset name")
+    parser.add_argument('--dataset_config_name', type=str, default=None, help="Dataset configuration name")
+    parser.add_argument('--train_data_dir', type=str, default=None, help="Directory of training data")
 
     args = parser.parse_args()
-    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
-    if env_local_rank != -1 and env_local_rank != args.local_rank:
-        args.local_rank = env_local_rank
 
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
+    # Load and merge YAML config if specified
+    if args.config_file:
+        yaml_config = parse_yaml_config(args.config_file)
+        args = merge_args_with_config(args, yaml_config)
 
     return args
+
+# def parse_args():
+#     parser = argparse.ArgumentParser(description="Simple example of a training script.")
+#     parser.add_argument(
+#         "--dataset_name",
+#         type=str,
+#         default=None,
+#         help=(
+#             "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
+#             " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
+#             " or to a folder containing files that HF Datasets can understand."
+#         ),
+#     )
+#     parser.add_argument(
+#         "--dataset_config_name",
+#         type=str,
+#         default=None,
+#         help="The config of the Dataset, leave as None if there's only one config.",
+#     )
+#     parser.add_argument(
+#         "--model_config_name_or_path",
+#         type=str,
+#         default=None,
+#         help="The config of the UNet model to train, leave as None to use standard DDPM configuration.",
+#     )
+#     parser.add_argument(
+#         "--train_data_dir",
+#         type=str,
+#         default=None,
+#         help=(
+#             "A folder containing the training data. Folder contents must follow the structure described in"
+#             " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
+#             " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
+#         ),
+#     )
+#     parser.add_argument(
+#         "--output_dir",
+#         type=str,
+#         default="ddpm-model-64",
+#         help="The output directory where the model predictions and checkpoints will be written.",
+#     )
+#     parser.add_argument("--overwrite_output_dir", action="store_true")
+#     parser.add_argument(
+#         "--cache_dir",
+#         type=str,
+#         default=None,
+#         help="The directory where the downloaded models and datasets will be stored.",
+#     )
+#     parser.add_argument(
+#         "--resolution",
+#         type=int,
+#         default=64,
+#         help=(
+#             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
+#             " resolution"
+#         ),
+#     )
+#     parser.add_argument(
+#         "--center_crop",
+#         default=False,
+#         action="store_true",
+#         help=(
+#             "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
+#             " cropped. The images will be resized to the resolution first before cropping."
+#         ),
+#     )
+#     parser.add_argument(
+#         "--random_flip",
+#         default=False,
+#         action="store_true",
+#         help="whether to randomly flip images horizontally",
+#     )
+#     parser.add_argument(
+#         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
+#     )
+#     parser.add_argument(
+#         "--eval_batch_size", type=int, default=16, help="The number of images to generate for evaluation."
+#     )
+#     parser.add_argument(
+#         "--dataloader_num_workers",
+#         type=int,
+#         default=0,
+#         help=(
+#             "The number of subprocesses to use for data loading. 0 means that the data will be loaded in the main"
+#             " process."
+#         ),
+#     )
+#     parser.add_argument("--num_epochs", type=int, default=100)
+#     parser.add_argument("--save_images_epochs", type=int, default=10, help="How often to save images during training.")
+#     parser.add_argument(
+#         "--save_model_epochs", type=int, default=10, help="How often to save the model during training."
+#     )
+#     parser.add_argument(
+#         "--gradient_accumulation_steps",
+#         type=int,
+#         default=1,
+#         help="Number of updates steps to accumulate before performing a backward/update pass.",
+#     )
+#     parser.add_argument(
+#         "--learning_rate",
+#         type=float,
+#         default=1e-4,
+#         help="Initial learning rate (after the potential warmup period) to use.",
+#     )
+#     parser.add_argument(
+#         "--lr_scheduler",
+#         type=str,
+#         default="cosine",
+#         help=(
+#             'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
+#             ' "constant", "constant_with_warmup"]'
+#         ),
+#     )
+#     parser.add_argument(
+#         "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+#     )
+#     parser.add_argument("--adam_beta1", type=float, default=0.95, help="The beta1 parameter for the Adam optimizer.")
+#     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
+#     parser.add_argument(
+#         "--adam_weight_decay", type=float, default=1e-6, help="Weight decay magnitude for the Adam optimizer."
+#     )
+#     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer.")
+#     parser.add_argument(
+#         "--use_ema",
+#         action="store_true",
+#         help="Whether to use Exponential Moving Average for the final model weights.",
+#     )
+#     parser.add_argument("--ema_inv_gamma", type=float, default=1.0, help="The inverse gamma value for the EMA decay.")
+#     parser.add_argument("--ema_power", type=float, default=3 / 4, help="The power value for the EMA decay.")
+#     parser.add_argument("--ema_max_decay", type=float, default=0.9999, help="The maximum decay magnitude for EMA.")
+#     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
+#     parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
+#     parser.add_argument(
+#         "--hub_model_id",
+#         type=str,
+#         default=None,
+#         help="The name of the repository to keep in sync with the local `output_dir`.",
+#     )
+#     parser.add_argument(
+#         "--hub_private_repo", action="store_true", help="Whether or not to create a private repository."
+#     )
+#     parser.add_argument(
+#         "--logger",
+#         type=str,
+#         default="tensorboard",
+#         choices=["tensorboard", "wandb"],
+#         help=(
+#             "Whether to use [tensorboard](https://www.tensorflow.org/tensorboard) or [wandb](https://www.wandb.ai)"
+#             " for experiment tracking and logging of model metrics and model checkpoints"
+#         ),
+#     )
+#     parser.add_argument(
+#         "--logging_dir",
+#         type=str,
+#         default="logs",
+#         help=(
+#             "[TensorBoard](https://www.tensorflow.org/tensorboard) log directory. Will default to"
+#             " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
+#         ),
+#     )
+#     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+#     parser.add_argument(
+#         "--mixed_precision",
+#         type=str,
+#         default="no",
+#         choices=["no", "fp16", "bf16"],
+#         help=(
+#             "Whether to use mixed precision. Choose"
+#             "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
+#             "and an Nvidia Ampere GPU."
+#         ),
+#     )
+#     parser.add_argument(
+#         "--prediction_type",
+#         type=str,
+#         default="epsilon",
+#         choices=["epsilon", "sample", "v_prediction"],
+#         help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0', OR use velocity prediction.",
+#     )
+#     parser.add_argument("--ddpm_num_steps", type=int, default=1000)
+#     parser.add_argument("--ddpm_num_inference_steps", type=int, default=1000)
+#     parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
+#     parser.add_argument(
+#         "--checkpointing_steps",
+#         type=int,
+#         default=500,
+#         help=(
+#             "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
+#             " training using `--resume_from_checkpoint`."
+#         ),
+#     )
+#     parser.add_argument(
+#         "--checkpoints_total_limit",
+#         type=int,
+#         default=None,
+#         help=("Max number of checkpoints to store."),
+#     )
+#     parser.add_argument(
+#         "--resume_from_checkpoint",
+#         type=str,
+#         default=None,
+#         help=(
+#             "Whether training should be resumed from a previous checkpoint. Use a path saved by"
+#             ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
+#         ),
+#     )
+#     parser.add_argument(
+#         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
+#     )
+
+#     args = parser.parse_args()
+#     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
+#     if env_local_rank != -1 and env_local_rank != args.local_rank:
+#         args.local_rank = env_local_rank
+
+#     if args.dataset_name is None and args.train_data_dir is None:
+#         raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
+
+#     return args
 
 if __name__ == "__main__":
     args = parse_args()
