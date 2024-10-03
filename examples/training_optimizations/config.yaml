@@ -46,7 +46,7 @@ ddpm:
   num_inference_steps: 1000
   beta_schedule: "linear"  # Options: linear, cosine
   prediction_type: "epsilon"  # Options: epsilon, sample, v_prediction
-
+  rescale_betas_zero_snr: false
 # EMA (Exponential Moving Average) configuration
 ema:
   inv_gamma: 1.0

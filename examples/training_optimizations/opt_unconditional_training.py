@@ -103,10 +103,14 @@ class Trainer:
     def _initialize_scheduler(self, args):
         accepts_prediction_type = "prediction_type" in set(inspect.signature(DDPMScheduler.__init__).parameters.keys())
         if accepts_prediction_type:
+            if args.prediction_type == 'v_prediction':
+                ### While training with Velocity pred, rescale the SNR ratio
+                args.rescale_betas_zero_snr = True
             noise_scheduler = DDPMScheduler(
                 num_train_timesteps=args.ddpm_num_steps,
                 beta_schedule=args.ddpm_beta_schedule,
                 prediction_type=args.prediction_type,
+                rescale_betas_zero_snr=args.rescale_betas_zero_snr
             )
         else:
             noise_scheduler = DDPMScheduler(num_train_timesteps=args.ddpm_num_steps, beta_schedule=args.ddpm_beta_schedule)
@@ -203,7 +207,29 @@ class Trainer:
                     {"test_samples": [wandb.Image(img) for img in images_processed], "epoch": epoch},
                     step=global_step,
                 )
-
+    
+    def log_metrics(self, loss, global_step, epoch):
+        if self.accelerator.is_main_process:
+            logs = {"loss": loss, "step": global_step, "epoch": epoch}
+            if self.args.logger == "tensorboard":
+                tracker = self.accelerator.get_tracker("tensorboard", unwrap=True)
+                tracker.add_scalar("loss", loss, global_step)
+            elif self.args.logger == "wandb":
+                self.accelerator.get_tracker("wandb").log(logs)
+            logger.info(f"Logging metrics: {logs}")
+    
+    def save_checkpoint(self, epoch, global_step):
+        if self.accelerator.is_main_process and (epoch % self.args.save_epochs == 0 or epoch == self.args.num_epochs - 1):
+            checkpoint_dir = os.path.join(self.args.output_dir, f"checkpoint-{epoch}")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            model_to_save = self.accelerator.unwrap_model(self.model)
+            model_to_save.save_pretrained(checkpoint_dir)
+            torch.save(self.optimizer.state_dict(), os.path.join(checkpoint_dir, "optimizer.pt"))
+            torch.save(self.lr_scheduler.state_dict(), os.path.join(checkpoint_dir, "scheduler.pt"))
+            if self.args.use_ema:
+                torch.save(self.ema_model.state_dict(), os.path.join(checkpoint_dir, "ema.pt"))
+            logger.info(f"Checkpoint saved at {checkpoint_dir}")
+            
     def train(self):
         if self.accelerator:
             self.model, self.optimizer, self.train_dataloader, self.lr_scheduler = self.accelerator.prepare(
@@ -227,7 +253,48 @@ class Trainer:
         global_step = 0
         first_epoch = 0
 
-        # Training loop here...
+        for epoch in range(first_epoch, self.args.num_epochs):
+            self.model.train()
+            for step, batch in enumerate(self.train_dataloader):
+                with self.accelerator.accumulate(self.model):
+                    # Predict the noise residual
+                    noise_pred = model(noisy_images, timesteps)
+
+                    if noise_scheduler.config.prediction_type == "v_prediction":
+                        #alpha_t = noise_scheduler.alphas[timesteps].view(-1,1,1,1,1)
+                        #v_pred = alpha_t*noise - torch.sqrt(1-alpha_t**2)*clean_images
+                        v_pred = noise_scheduler.get_velocity(clean_images,noise,timesteps)
+                        v_recon = get_orig_from_velocity(noise_pred,timesteps,noisy_images,noise_scheduler)
+                        # loss = F.huber_loss(weights*noise_pred, weights*v_pred)
+                        loss = F.huber_loss(noise_pred, v_pred)
+
+                    elif noise_scheduler.config.prediction_type == "epsilon":
+                        # loss = F.huber_loss(weights*noise_pred, weights*noise)
+                        loss = F.huber_loss(noise_pred, noise)
+                        v_recon = noisy_images - noise_pred
+
+                    elif noise_scheduler.config.prediction_type == "sample":
+                        # loss = F.huber_loss(weights*noise_pred, weights*clean_images)
+                        loss = F.huber_loss(noise_pred, clean_images)
+                        v_recon = noise_pred
+                    self.accelerator.backward(loss)
+
+                    if self.accelerator.sync_gradients:
+                        self.optimizer.step()
+                        self.lr_scheduler.step()
+                        self.optimizer.zero_grad()
+
+                    if self.args.use_ema:
+                        self.ema_model.update(self.model.parameters())
+
+                    global_step += 1
+                    if global_step % self.args.logging_steps == 0:
+                        self.log_metrics(loss.item(), global_step, epoch)
+
+            # Save checkpoints and log evaluation metrics at the end of each epoch
+            self.save_checkpoint(epoch, global_step)
+            self.evaluate_model_for_visual_inspection(self.args, epoch, global_step)
+
 
 
 def parse_yaml_config(yaml_file):
@@ -299,7 +366,12 @@ def parse_args():
     parser.add_argument('--ddpm_num_inference_steps', type=int, default=1000, help="Number of inference steps in DDPM")
     parser.add_argument('--ddpm_beta_schedule', type=str, choices=['linear', 'cosine'], default='linear', help="Beta schedule for DDPM")
     parser.add_argument('--prediction_type', type=str, choices=['epsilon', 'sample', 'v_prediction'], default='epsilon', help="Prediction type for DDPM")
-
+    parser.add_argument(
+    "--rescale_betas_zero_snr", 
+    type=bool, 
+    default=False, 
+    help="Rescale betas to achieve zero SNR during training in DDPM."
+)
     # EMA config
     parser.add_argument('--ema_inv_gamma', type=float, default=1.0, help="EMA inverse gamma")
     parser.add_argument('--ema_power', type=float, default=0.75, help="EMA power")
